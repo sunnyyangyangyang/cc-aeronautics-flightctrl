@@ -5,19 +5,19 @@ local CONFIG = {}
 
 -- Peripheral sides (attach peripherals to top/bottom to avoid Sable #638 bug)
 CONFIG.peripherals = {
-    gimbal = "bottom",           -- Gimbal Sensor (attitude: pitch + roll)
-    altitude = "top",            -- Altitude Sensor
-    velocity = "back",           -- Velocity Sensor (facing forward)
-    navigation = "front",        -- Navigation Table (optional, for heading)
+    gimbal = "left",           -- Gimbal Sensor (attitude: pitch + roll)
+    altitude = nil,            -- Altitude Sensor
+    velocity = nil,           -- Velocity Sensor (facing forward)
+    navigation = nil,        -- Navigation Table (optional, for heading)
     -- Control actuators via Sequenced Gearshift
-    elevator = "right",          -- Sequenced Gearshift -> Elevator Swivel Bearing
-    aileron_left = "left",       -- Sequenced Gearshift -> Left Aileron
-    aileron_right = "bottom",    -- Sequenced Gearshift -> Right Aileron
-    rudder = "top",              -- Sequenced Gearshift -> Rudder (optional)
+    elevator = "Create_SequencedGearshift_8",          -- Sequenced Gearshift -> Elevator Swivel Bearing
+    aileron_left = "Create_SequencedGearshift_6",       -- Sequenced Gearshift -> Left Aileron
+    aileron_right = "Create_SequencedGearshift_7",    -- Sequenced Gearshift -> Right Aileron
+    rudder = "right",              -- Sequenced Gearshift -> Rudder (optional)
     -- Throttle control
-    throttle = "back",           -- Rotation Speed Controller for propeller
+    throttle = "Create_RotationSpeedController_0",           -- Rotation Speed Controller for propeller
     -- Display
-    display = "front",           -- Display Link or monitor
+    display = nil,           -- Display Link or monitor
 }
 
 -- Aircraft limits
@@ -25,9 +25,9 @@ CONFIG.limits = {
     max_throttle_rpm = 256,      -- Max propeller RPM
     min_throttle_rpm = 0,        -- Min propeller RPM (idle)
     idle_throttle_rpm = 64,      -- Idle/cruise minimum
-    max_elevator_angle = 30,     -- Max elevator deflection (degrees)
+    max_elevator_angle = 45,     -- Max elevator deflection (degrees), up/down
     max_aileron_angle = 25,      -- Max aileron deflection (degrees)
-    max_rudder_angle = 20,       -- Max rudder deflection (degrees)
+    max_rudder_angle = 45,       -- Max rudder deflection (degrees), left/right
     gearshift_speed_mod = 1,     -- Sequenced Gearshift speed modifier (-2..2)
 }
 

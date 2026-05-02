@@ -87,22 +87,54 @@ function Hardware:initPeripherals()
         self.peripherals.display = peripheral.wrap(sides.display)
     end
 
-   -- Print status
-    local sensor_count = 0
-    local actuator_count = 0
-    for name, side in pairs(self.config.peripherals or {}) do
-        local p = self.peripherals[name]
-        if p and peripheral.exists(side) then
-            local ptype = peripheral.getType(side) or "unknown"
-            if ptype == "gimbal_sensor" or ptype == "altitude_sensor"
-               or ptype == "velocity_sensor" or ptype == "navigation_table" then
-                sensor_count = sensor_count + 1
-            else
-                actuator_count = actuator_count + 1
-            end
-        end
-    end
-    print("[HW] Peripherals: " .. sensor_count .. " sensors, " .. actuator_count .. " actuators")
+    -- Print detailed status for each peripheral
+     local sensor_count = 0
+     local actuator_count = 0
+     local actuator_names = {}
+     local sensor_names = {}
+     local missing_list = {}
+
+     -- Define which keys are sensors vs actuators
+     local sensor_keys = {"gimbal", "altitude", "velocity", "navigation"}
+     local actuator_keys = {"elevator", "aileron_left", "aileron_right", "rudder", "throttle", "display"}
+
+     for _, name in ipairs(sensor_keys) do
+         local side = (self.config.peripherals or {})[name]
+         if not side then
+             table.insert(missing_list, name .. "(not configured)")
+         elseif peripheral.isPresent(side) then
+             local ptype = peripheral.getType(side) or "unknown"
+             print("[HW] OK   " .. name .. " -> " .. side .. " (" .. ptype .. ")")
+             sensor_count = sensor_count + 1
+             table.insert(sensor_names, name)
+         else
+             table.insert(missing_list, name .. "(" .. side .. ")")
+         end
+     end
+
+     for _, name in ipairs(actuator_keys) do
+         local side = (self.config.peripherals or {})[name]
+         if not side then
+             -- Only warn for critical actuators
+             if name == "elevator" or name == "throttle" then
+                 table.insert(missing_list, name .. "(not configured)")
+             end
+         elseif peripheral.isPresent(side) then
+             local ptype = peripheral.getType(side) or "unknown"
+             print("[HW] OK   " .. name .. " -> " .. side .. " (" .. ptype .. ")")
+             actuator_count = actuator_count + 1
+             table.insert(actuator_names, name)
+         else
+             table.insert(missing_list, name .. "(" .. side .. ")")
+         end
+     end
+
+     print("[HW] Summary: " .. sensor_count .. " sensors, " .. actuator_count .. " actuators ("
+           .. table.concat(actuator_names, ", ") or "none" .. ")")
+
+     if #missing_list > 0 then
+         print("[HW] WARNING - Missing: " .. table.concat(missing_list, ", "))
+     end
 end
 
 --- Read all sensor data
@@ -215,14 +247,14 @@ function Hardware:setElevator(angle)
     -- Calculate delta (Sequenced Gearshift rotate() is RELATIVE)
     local current = self.surface_angles.elevator
     local delta = angle - current
-    if math.abs(delta) < 0.5 then return end  -- Too small to matter
+    if math.abs(delta) < 0.1 then return end  -- Lowered threshold for finer control
 
     -- rotate(angle, modifier): angle must be positive integer, modifier integer [-2..2]
     local rot_angle = math.max(1, math.floor(math.abs(delta) + 0.5))
     local modifier = delta > 0 and 1 or -1
     local speed_mod = self.config.limits.gearshift_speed_mod or 1
-    -- Clamp modifier to valid range [-2..2]
-    local final_mod = math.max(-2, math.min(2, modifier * math.abs(speed_mod)))
+    -- Clamp modifier to valid range [-2..2], ensure integer
+    local final_mod = math.floor(math.max(-2, math.min(2, modifier * math.abs(speed_mod))))
 
     if self.peripherals.elevator.rotate then
         self.peripherals.elevator.rotate(rot_angle, final_mod)
@@ -232,30 +264,42 @@ end
 
 --- Set aileron deflection (differential, delta-based)
 -- @param angle Target aileron angle (positive = right wing down = roll right)
+-- Note: Works with single aileron (only left or only right connected)
 function Hardware:setAilerons(angle)
-    if not self.peripherals.aileron_left or not self.peripherals.aileron_right then return end
+    -- Allow single-side operation: only return if BOTH are missing
+    if not self.peripherals.aileron_left and not self.peripherals.aileron_right then return end
 
     -- Clamp to limits
     local max_angle = self.config.limits.max_aileron_angle or 25
     angle = math.max(-max_angle, math.min(max_angle, angle))
 
     local speed_mod = self.config.limits.gearshift_speed_mod or 1
-    local final_mod = math.max(-2, math.min(2, math.abs(speed_mod)))
+    -- Ensure integer for Create Java API
+    local final_mod = math.floor(math.max(-2, math.min(2, math.abs(speed_mod))))
 
     -- Differential: left and right ailerons move opposite
-    -- Calculate delta for each side
-    local left_delta = -angle - self.surface_angles.aileron_left
-    local right_delta = angle - self.surface_angles.aileron_right
-
-    if math.abs(left_delta) >= 0.5 and self.peripherals.aileron_left.rotate then
-        local rot_angle = math.max(1, math.floor(math.abs(left_delta) + 0.5))
-        local mod = left_delta > 0 and final_mod or (-final_mod)
-        self.peripherals.aileron_left.rotate(rot_angle, mod)
+    -- Left aileron
+    if self.peripherals.aileron_left then
+        local left_delta = -angle - self.surface_angles.aileron_left
+        if math.abs(left_delta) >= 0.1 then
+            local rot_angle = math.max(1, math.floor(math.abs(left_delta) + 0.5))
+            local mod = left_delta > 0 and final_mod or (-final_mod)
+            if self.peripherals.aileron_left.rotate then
+                self.peripherals.aileron_left.rotate(rot_angle, mod)
+            end
+        end
     end
-    if math.abs(right_delta) >= 0.5 and self.peripherals.aileron_right.rotate then
-        local rot_angle = math.max(1, math.floor(math.abs(right_delta) + 0.5))
-        local mod = right_delta > 0 and final_mod or (-final_mod)
-        self.peripherals.aileron_right.rotate(rot_angle, mod)
+
+    -- Right aileron
+    if self.peripherals.aileron_right then
+        local right_delta = angle - self.surface_angles.aileron_right
+        if math.abs(right_delta) >= 0.1 then
+            local rot_angle = math.max(1, math.floor(math.abs(right_delta) + 0.5))
+            local mod = right_delta > 0 and final_mod or (-final_mod)
+            if self.peripherals.aileron_right.rotate then
+                self.peripherals.aileron_right.rotate(rot_angle, mod)
+            end
+        end
     end
 
     self.surface_angles.aileron_left = -angle
@@ -273,12 +317,13 @@ function Hardware:setRudder(angle)
 
     -- Calculate delta
     local delta = angle - self.surface_angles.rudder
-    if math.abs(delta) < 0.5 then return end
+    if math.abs(delta) < 0.1 then return end
 
     local rot_angle = math.max(1, math.floor(math.abs(delta) + 0.5))
     local modifier = delta > 0 and 1 or -1
     local speed_mod = self.config.limits.gearshift_speed_mod or 1
-    local final_mod = math.max(-2, math.min(2, modifier * math.abs(speed_mod)))
+    -- Ensure integer for Create Java API
+    local final_mod = math.floor(math.max(-2, math.min(2, modifier * math.abs(speed_mod))))
 
     if self.peripherals.rudder.rotate then
         self.peripherals.rudder.rotate(rot_angle, final_mod)

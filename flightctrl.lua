@@ -51,6 +51,11 @@ function FC:init()
     self.mode = "IDLE"          -- IDLE, MANUAL, AUTO, HOVER, CRUISE, LANDING, EMERGENCY
     self.running = true
 
+    -- Logging
+    self.log_enabled = false
+    self.log_file = nil
+    self.log_tick = 0
+
     -- Targets
     self.targets = {
         airspeed = CONFIG.defaults.target_airspeed,
@@ -187,15 +192,11 @@ function FC:modeAuto(targetAirspeed, targetAltitude)
     print("[FC] AUTO mode - Speed: " .. self.targets.airspeed ..
           ", Alt: " .. self.targets.altitude)
 
-    while self.mode == "AUTO" and self.running do
-        os.sleep(CONFIG.loop.update_rate)
+    local tick = 0
 
-        -- Check for termination
-        local ev = os.pullEvent(0)
-        if ev == "terminate" then
-            self:emergencyStop()
-            break
-        end
+    while self.mode == "AUTO" and self.running do
+        tick = tick + 1
+        self.log_tick = self.log_tick + 1
 
         -- Read sensors
         local s = self:readSensors()
@@ -223,18 +224,34 @@ function FC:modeAuto(targetAirspeed, targetAltitude)
         local throttle_cmd = self.pid_throttle:update(speed_error, CONFIG.loop.update_rate)
 
         -- === Stall protection ===
+        local stall_protected = false
         if s.airspeed < CONFIG.safety.stall_speed and s.airspeed > 0 then
             -- Pitch down to gain speed, increase throttle
             elevator_cmd = math.min(elevator_cmd, -10)
             throttle_cmd = math.max(throttle_cmd, 192)
+            stall_protected = true
         end
 
         -- === Ground proximity protection ===
+        local ground_protected = false
         if s.altitude < CONFIG.safety.ground_proximity_alt and s.altitude > 0 then
             if s.vertical_speed < -2 then
                 -- Descending too fast near ground: pitch up
                 elevator_cmd = math.max(elevator_cmd, 15)
+                ground_protected = true
             end
+        end
+
+        -- Write log (every 5 ticks = ~250ms)
+        if self.log_enabled and self.log_file and self.log_tick % 5 == 0 then
+            local log_line = string.format("%d,%+.2f,%+.2f,%.2f,%.2f,%.2f,%+.2f,%+.2f,%+.2f,%.2f,%.0f,%.0f,%.0f,%s,%s",
+                tick, s.pitch, s.roll, s.altitude, s.airspeed, s.vertical_speed,
+                alt_error, pitch_error, roll_error, speed_error,
+                elevator_cmd, aileron_cmd, rudder_cmd, throttle_cmd,
+                stall_protected and "STALL" or "no",
+                ground_protected and "GROUND" or "no")
+            self.log_file.write(log_line .. "\n")
+            self.log_file.flush()
         end
 
         -- Apply controls
@@ -244,6 +261,16 @@ function FC:modeAuto(targetAirspeed, targetAltitude)
         self.hw:setRudder(rudder_cmd)
 
         self:updateDisplay()
+
+        -- Debug: print status every 20 ticks (~1 second)
+        if tick % 20 == 0 then
+            print(string.format("[AUTO] #%d P:%+.1f R:%+.1f A:%.1f S:%.1f | Elv:%.1f Ail:%.1f Rud:%.1f Thr:%.0f",
+                tick, s.pitch, s.roll, s.altitude, s.airspeed,
+                elevator_cmd, aileron_cmd, rudder_cmd, throttle_cmd))
+        end
+
+        -- Sleep but also handle termination gracefully
+        os.sleep(CONFIG.loop.update_rate)
     end
 end
 
@@ -446,6 +473,29 @@ function FC:handleCommand(input)
         print("[FC] Throttle set to " .. (arg1 or 0) .. " RPM")
     elseif cmd == "test" then
         self:testControls()
+    elseif cmd == "log" then
+        if arg1 == "on" or arg1 == "enable" then
+            self:enableLog()
+        elseif arg1 == "off" or arg1 == "disable" then
+            self:disableLog()
+        else
+            print(string.format("[FC] Log: %s (type 'log on' or 'log off')",
+                self.log_enabled and "ENABLED" or "DISABLED"))
+        end
+    elseif cmd == "reset" or cmd == "center" then
+        -- 一键归零：先向执行器发送归零命令，再重置追踪和 PID
+        print("[FC] Resetting all control surfaces to center...")
+        -- 主动下达归零命令给所有执行器（基于当前追踪的角度计算 delta）
+        self.hw:setElevator(0)
+        self.hw:setAilerons(0)
+        self.hw:setRudder(0)
+        -- 等待命令执行完成
+        os.sleep(0.2)
+        -- 重置追踪状态（确保内部状态与实际一致）
+        self.hw:resetSurfaceTracking()
+        -- 重置 PID 状态
+        self:resetPIDs()
+        print("[FC] All control surfaces centered, tracking and PIDs reset.")
     else
         print("[FC] Unknown command: " .. cmd)
         print("[FC] Type 'help' for available commands")
@@ -464,6 +514,8 @@ function FC:printHelp()
     print("  setspeed <rpm>      - Set target airspeed")
     print("  status              - Show sensor readings")
     print("  test                - Test all control surfaces")
+    print("  reset / center      - Reset all surfaces to zero + clear tracking")
+    print("  log on / off        - Enable/disable flight data logging")
     print("  emergency / panic   - Emergency stop")
     print("  stop                - Shutdown system")
     print("  help                - Show this help")
@@ -493,47 +545,105 @@ function FC:switchMode(modeFunc)
 end
 
 function FC:testControls()
-    print("[FC] Testing control surfaces...")
+    print("[FC] === Control Surface Test ===")
+
+    -- Strict check: report which actuators are available
+    local actuator_configs = {
+        {name = "elevator",     side = self.hw.config.peripherals.elevator},
+        {name = "aileron_left", side = self.hw.config.peripherals.aileron_left},
+        {name = "aileron_right",side = self.hw.config.peripherals.aileron_right},
+        {name = "rudder",       side = self.hw.config.peripherals.rudder},
+        {name = "throttle",     side = self.hw.config.peripherals.throttle},
+    }
+
+    local found = {}
+    local missing = {}
+
+    for _, act in ipairs(actuator_configs) do
+        if not act.side then
+            table.insert(missing, act.name .. "(not configured)")
+        elseif peripheral.isPresent(act.side) then
+            local ptype = peripheral.getType(act.side) or "unknown"
+            print("[HW] OK   " .. act.name .. " -> " .. act.side .. " (" .. ptype .. ")")
+            table.insert(found, act.name)
+        else
+            table.insert(missing, act.name .. "(" .. act.side .. ")")
+        end
+    end
+
+    if #missing > 0 then
+        print("[HW] WARNING - Missing actuators: " .. table.concat(missing, ", "))
+        print("[HW] Tip: Edit config/settings.lua to match your physical setup")
+    end
+
+    if #found == 0 then
+        print("[FC] ERROR: No actuators found! Cannot run test.")
+        print("[FC] Check config/settings.lua peripheral sides match your computer.")
+        return
+    end
+
+    print("[FC] Found " .. #found .. " actuator(s): " .. table.concat(found, ", "))
+    print("[FC] Testing available control surfaces...")
+
     -- Reset tracking assuming surfaces start at neutral
     self.hw:resetSurfaceTracking()
 
     -- Test throttle
-    print("[FC] Throttle: 0 -> max -> 0")
-    self.hw:setThrottle(0)
-    os.sleep(0.5)
-    self.hw:setThrottle(128)
-    os.sleep(0.5)
-    self.hw:setThrottle(0)
-    os.sleep(0.5)
+    if self.hw.peripherals.throttle then
+        print("[FC] Throttle: 0 -> 128 -> 0")
+        self.hw:setThrottle(0)
+        os.sleep(0.5)
+        self.hw:setThrottle(128)
+        os.sleep(0.5)
+        self.hw:setThrottle(0)
+        os.sleep(0.5)
+    else
+        print("[FC] Throttle: SKIPPED (not connected)")
+    end
 
     -- Test elevator
-    print("[FC] Elevator: full up -> full down -> center")
-    self.hw:setElevator(15)
-    os.sleep(0.5)
-    self.hw:setElevator(-15)
-    os.sleep(0.5)
-    self.hw:setElevator(0)
-    os.sleep(0.5)
+    if self.hw.peripherals.elevator then
+        print("[FC] Elevator: up -> down -> center")
+        self.hw:setElevator(15)
+        os.sleep(0.5)
+        self.hw:setElevator(-15)
+        os.sleep(0.5)
+        self.hw:setElevator(0)
+        os.sleep(0.5)
+    else
+        print("[FC] Elevator: SKIPPED (not connected)")
+    end
 
-    -- Test ailerons
-    print("[FC] Ailerons: left -> right -> center")
-    self.hw:setAilerons(15)
-    os.sleep(0.5)
-    self.hw:setAilerons(-15)
-    os.sleep(0.5)
-    self.hw:setAilerons(0)
-    os.sleep(0.5)
+    -- Test ailerons (works with single-side)
+    if self.hw.peripherals.aileron_left or self.hw.peripherals.aileron_right then
+        local sides = {}
+        if self.hw.peripherals.aileron_left then table.insert(sides, "L") end
+        if self.hw.peripherals.aileron_right then table.insert(sides, "R") end
+        print("[FC] Ailerons (" .. table.concat(sides, "+") .. "): left -> right -> center")
+        self.hw:setAilerons(15)
+        os.sleep(0.5)
+        self.hw:setAilerons(-15)
+        os.sleep(0.5)
+        self.hw:setAilerons(0)
+        os.sleep(0.5)
+    else
+        print("[FC] Ailerons: SKIPPED (neither connected)")
+    end
 
     -- Test rudder
-    print("[FC] Rudder: left -> right -> center")
-    self.hw:setRudder(10)
-    os.sleep(0.5)
-    self.hw:setRudder(-10)
-    os.sleep(0.5)
-    self.hw:setRudder(0)
-    os.sleep(0.5)
+    if self.hw.peripherals.rudder then
+        print("[FC] Rudder: left -> right -> center")
+        self.hw:setRudder(10)
+        os.sleep(0.5)
+        self.hw:setRudder(-10)
+        os.sleep(0.5)
+        self.hw:setRudder(0)
+        os.sleep(0.5)
+    else
+        print("[FC] Rudder: SKIPPED (not connected)")
+    end
 
-    print("[FC] Test complete!")
+    print("[FC] === Test complete! ===")
 end
 
 -- ============================================================
@@ -554,6 +664,45 @@ function FC:run()
     self.hw:stopThrottle()
     self.hw:neutralize()
     print("[FC] Goodbye, pilot!")
+end
+
+-- ============================================================
+-- Logging
+-- ============================================================
+function FC:enableLog()
+    if self.log_enabled then
+        print("[FC] Log already enabled.")
+        return
+    end
+    -- Create log file with timestamp
+    local timestamp = os.date("%Y%m%d_%H%M%S")
+    local filename = "/logs/flight_" .. timestamp .. ".csv"
+    -- Ensure logs directory exists
+    fs.makeDir("/logs")
+    self.log_file = fs.open(filename, "w")
+    if not self.log_file then
+        print("[FC] ERROR: Failed to create log file at " .. filename)
+        return
+    end
+    -- Write CSV header
+    self.log_file.writeLine("tick,pitch,roll,altitude,airspeed,vertical_speed,alt_error,pitch_error,roll_error,speed_error,elevator_cmd,aileron_cmd,rudder_cmd,throttle_cmd,stall_protected,ground_protected")
+    self.log_file.flush()
+    self.log_enabled = true
+    self.log_tick = 0
+    print("[FC] Log ENABLED -> " .. filename)
+end
+
+function FC:disableLog()
+    if not self.log_enabled then
+        print("[FC] Log already disabled.")
+        return
+    end
+    if self.log_file then
+        self.log_file.close()
+        self.log_file = nil
+    end
+    self.log_enabled = false
+    print("[FC] Log DISABLED.")
 end
 
 -- Start
