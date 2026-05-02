@@ -10,7 +10,7 @@ CONFIG.peripherals = {
     velocity = nil,           -- Velocity Sensor (facing forward)
     navigation = nil,        -- Navigation Table (optional, for heading)
     -- Control actuators via Sequenced Gearshift
-    elevator = "Create_SequencedGearshift_8",          -- Sequenced Gearshift -> Elevator Swivel Bearing
+    elevator = "Create_SequencedGearshift_10",          -- Sequenced Gearshift -> Elevator Swivel Bearing
     aileron_left = "Create_SequencedGearshift_6",       -- Sequenced Gearshift -> Left Aileron
     aileron_right = "Create_SequencedGearshift_7",    -- Sequenced Gearshift -> Right Aileron
     rudder = "right",              -- Sequenced Gearshift -> Rudder (optional)

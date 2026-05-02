@@ -145,9 +145,36 @@ function Hardware:readSensors()
     if dt <= 0 then dt = 0.05 end
     self.prev_time = now
 
-    -- Try CC: Sable sublevel API (only works on assembled contraptions)
+    -- Try CC: Sable sublevel API (works on assembled contraptions)
+    -- Always read sublevel data: altitude/speed are PRIMARY sources
     if sublevel and sublevel.isInPlotGrid and sublevel.isInPlotGrid() then
-        self:readSublevelData()
+        -- Altitude from pose (PRIMARY)
+        if sublevel.getLogicalPose then
+            local pose = sublevel.getLogicalPose()
+            if pose and pose.y then
+                local alt = pose.y
+                self.sensors.vertical_speed = (alt - self.prev_altitude) / dt
+                self.prev_altitude = alt
+                self.sensors.altitude = alt
+            end
+        end
+
+        -- Linear velocity for airspeed (PRIMARY)
+        if sublevel.getLinearVelocity then
+            local linVel = sublevel.getLinearVelocity()
+            local speed = math.sqrt(
+                (linVel.x or 0)^2 + (linVel.y or 0)^2 + (linVel.z or 0)^2
+            )
+            self.sensors.airspeed = speed
+        end
+
+        -- Angular velocity for rate-based PID control
+        if sublevel.getAngularVelocity then
+            local angVel = sublevel.getAngularVelocity()
+            self.sensors.pitch_rate = angVel.x or 0
+            self.sensors.roll_rate = angVel.z or 0
+            self.sensors.yaw_rate = angVel.y or 0
+        end
     end
 
     -- Read gimbal sensor (attitude)
@@ -157,22 +184,21 @@ function Hardware:readSensors()
         self.sensors.roll = angles[2] or 0
     end
 
-    -- Read altitude sensor
-    if self.peripherals.altitude and self.peripherals.altitude.getHeight then
+    -- Fallback: Altitude Sensor peripheral (only if sublevel not available)
+    if self.sensors.altitude == 0 and self.peripherals.altitude and self.peripherals.altitude.getHeight then
         local alt = self.peripherals.altitude.getHeight()
-        -- Calculate vertical speed
         self.sensors.vertical_speed = (alt - self.prev_altitude) / dt
         self.prev_altitude = alt
         self.sensors.altitude = alt
     end
 
-    -- Read air pressure
+    -- Air pressure from altitude sensor
     if self.peripherals.altitude and self.peripherals.altitude.getAirPressure then
         self.sensors.air_pressure = self.peripherals.altitude.getAirPressure()
     end
 
-    -- Read velocity sensor (airspeed)
-    if self.peripherals.velocity and self.peripherals.velocity.getVelocity then
+    -- Fallback: Velocity Sensor peripheral (only if sublevel not available)
+    if self.sensors.airspeed == 0 and self.peripherals.velocity and self.peripherals.velocity.getVelocity then
         self.sensors.airspeed = self.peripherals.velocity.getVelocity()
     end
 
