@@ -1,3 +1,4 @@
+###not stable, experimental code
 # Aeronautics 飞控系统 - 使用说明书
 
 ## 一、前置条件
