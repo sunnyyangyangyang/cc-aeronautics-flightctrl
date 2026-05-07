@@ -638,7 +638,8 @@ function FC:switchMode(modeFunc)
         function()
             -- Command listener
             while self.running do
-                local input = read("[FC] > ")
+                write("[FC] > ")
+                local input = read()
                 if input then
                     self:handleCommand(input)
                 end
@@ -757,7 +758,8 @@ function FC:run()
 
     -- Main command loop
     while self.running do
-        local input = read("[FC] > ")
+        write("[FC] > ")
+        local input = read()
         if input then
             self:handleCommand(input)
         end
