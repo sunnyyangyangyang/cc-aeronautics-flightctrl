@@ -1,169 +1,163 @@
--- Hardware Abstraction Layer for Aeronautics Flight Control
--- Wraps all peripheral interactions for sensors and actuators
+-- lib/hardware.lua  v1.3.2-patch
+-- PATCH list:
+--   [1] rotateSmooth(): new unified gearshift driver
+--       - separates speed modifier from direction
+--       - enforces modifier != 0 (was causing silent no-ops)
+--       - caps single-frame delta to max_deg_per_tick to prevent jumps
+--   [2] setRudder: was using wrong modifier sign calculation
+--   [3] setAilerons: same fix, single-side operation preserved
+--   [4] All surface setters use rotateSmooth()
 
 local Hardware = {}
 Hardware.__index = Hardware
 
---- Initialize hardware layer
--- @param config Configuration table with peripheral sides
--- @return Hardware instance
 function Hardware.new(config)
     local self = setmetatable({}, Hardware)
     self.config = config or {}
-
-    -- Raw peripherals
     self.peripherals = {}
-    -- API availability
     self.has_aero = false
-    -- Parsed sensor data
     self.sensors = {
-        pitch = 0,               -- Pitch angle (degrees)
-        roll = 0,                -- Roll angle (degrees)
-        altitude = 0,            -- Altitude (blocks)
-        airspeed = 0,            -- Forward airspeed
-        air_pressure = 1.0,      -- Air pressure (0-1)
-        heading = 0,             -- Heading relative to target (degrees)
-        vertical_speed = 0,      -- Vertical speed (blocks/s)
-        -- Angular velocity from CC: Sable sublevel API
-        pitch_rate = 0,
-        roll_rate = 0,
-        yaw_rate = 0,
+        pitch = 0, roll = 0, altitude = 0, airspeed = 0,
+        air_pressure = 1.0, heading = 0, vertical_speed = 0,
+        pitch_rate = 0, roll_rate = 0, yaw_rate = 0,
     }
- -- Previous altitude for vertical speed calculation
     self.prev_altitude = 0
     self.prev_time = 0
 
-    -- Track current control surface angles for delta-based rotation
-    -- Sequenced Gearshift rotate(angle) is RELATIVE ("rotates BY angle"), not absolute!
-    -- angle must be a positive integer, modifier must be integer in [-2..2]
     self.surface_angles = {
-        elevator = 0,
-        aileron_left = 0,
-        aileron_right = 0,
-        rudder = 0,
+        elevator = 0, aileron_left = 0, aileron_right = 0, rudder = 0,
     }
+
+    -- PATCH [1]: max degrees moved per single rotate() call
+    -- Gearshift will still move at its own speed, but we never send a delta
+    -- larger than this in one tick — prevents the "catch-up lurch"
+    self.max_deg_per_tick = 8   -- tune: lower = smoother but slower tracking
 
     return self
 end
 
---- Initialize all peripherals
--- Call this once at startup
+-- ============================================================
+-- PATCH [1]: unified smooth gearshift driver
+-- @param peripheral  the wrapped Sequenced Gearshift peripheral
+-- @param target      desired absolute angle (degrees)
+-- @param tracked     current tracked angle (degrees)
+-- @param max_angle   hardware clamp (degrees)
+-- @param speed_mod   config gearshift_speed_mod (1 or 2 typically)
+-- @returns           new tracked angle after this tick's move
+-- ============================================================
+function Hardware:rotateSmooth(peripheral, target, tracked, max_angle, speed_mod)
+    if not peripheral or not peripheral.rotate then
+        return tracked
+    end
+
+    -- Clamp target to hardware limits
+    target = math.max(-max_angle, math.min(max_angle, target))
+
+    local delta = target - tracked
+    if math.abs(delta) < 0.5 then
+        return tracked   -- close enough, skip (avoid tiny jitter calls)
+    end
+
+    -- PATCH: cap the move per tick so we never send a huge single rotate()
+    local capped_delta = delta
+    if math.abs(capped_delta) > self.max_deg_per_tick then
+        capped_delta = math.sign_hw(delta) * self.max_deg_per_tick
+    end
+
+    -- rotate(angle, modifier):
+    --   angle    = positive integer, how many degrees to rotate
+    --   modifier = integer in [-2..2], sign = direction, magnitude = speed
+    -- PATCH: keep direction (sign) and speed (magnitude) separate
+    local rot_angle = math.max(1, math.floor(math.abs(capped_delta) + 0.5))
+    local direction = math.sign_hw(capped_delta)   -- +1 or -1, never 0
+    local speed     = math.max(1, math.min(2, math.floor(math.abs(speed_mod or 1))))
+    local modifier  = direction * speed            -- e.g. -2, -1, +1, +2
+
+    peripheral.rotate(rot_angle, modifier)
+
+    -- Return the new tracked position (capped, not the full target)
+    return tracked + capped_delta
+end
+
+-- Simple sign helper (avoids dependency on math.sign_or from controller)
+function math.sign_hw(x)
+    if x >= 0 then return 1 else return -1 end
+end
+
+-- ============================================================
+-- initPeripherals (unchanged from original)
+-- ============================================================
 function Hardware:initPeripherals()
     local sides = self.config.peripherals or {}
 
-    -- Sensors
-    if sides.gimbal then
-        self.peripherals.gimbal = peripheral.wrap(sides.gimbal)
-    end
-    if sides.altitude then
-        self.peripherals.altitude = peripheral.wrap(sides.altitude)
-    end
-    if sides.velocity then
-        self.peripherals.velocity = peripheral.wrap(sides.velocity)
-    end
-    if sides.navigation then
-        self.peripherals.navigation = peripheral.wrap(sides.navigation)
-    end
+    if sides.gimbal     then self.peripherals.gimbal      = peripheral.wrap(sides.gimbal)      end
+    if sides.altitude   then self.peripherals.altitude    = peripheral.wrap(sides.altitude)    end
+    if sides.velocity   then self.peripherals.velocity    = peripheral.wrap(sides.velocity)    end
+    if sides.navigation then self.peripherals.navigation  = peripheral.wrap(sides.navigation)  end
+    if sides.elevator   then self.peripherals.elevator    = peripheral.wrap(sides.elevator)    end
+    if sides.aileron_left  then self.peripherals.aileron_left  = peripheral.wrap(sides.aileron_left)  end
+    if sides.aileron_right then self.peripherals.aileron_right = peripheral.wrap(sides.aileron_right) end
+    if sides.rudder     then self.peripherals.rudder      = peripheral.wrap(sides.rudder)      end
+    if sides.throttle   then self.peripherals.throttle    = peripheral.wrap(sides.throttle)    end
+    if sides.display    then self.peripherals.display     = peripheral.wrap(sides.display)     end
 
-    -- Actuators (Sequenced Gearshift for control surfaces)
-    if sides.elevator then
-        self.peripherals.elevator = peripheral.wrap(sides.elevator)
-    end
-    if sides.aileron_left then
-        self.peripherals.aileron_left = peripheral.wrap(sides.aileron_left)
-    end
-    if sides.aileron_right then
-        self.peripherals.aileron_right = peripheral.wrap(sides.aileron_right)
-    end
-    if sides.rudder then
-        self.peripherals.rudder = peripheral.wrap(sides.rudder)
-    end
-
-    -- Throttle (Rotation Speed Controller)
-    if sides.throttle then
-        self.peripherals.throttle = peripheral.wrap(sides.throttle)
-    end
-
-    -- Display
-    if sides.display then
-        self.peripherals.display = peripheral.wrap(sides.display)
-    end
-
-    -- Check aero/aerodynamics API availability
     if aero and aero.getAirPressure then
         self.has_aero = true
         print("[HW] OK   aero API available")
     end
-
-    -- Check sublevel API availability
     if sublevel and sublevel.isInPlotGrid then
         print("[HW] OK   sublevel API available")
     end
 
-    -- Print detailed status for each peripheral
-     local sensor_count = 0
-     local actuator_count = 0
-     local actuator_names = {}
-     local sensor_names = {}
-     local missing_list = {}
+    local sensor_keys   = {"gimbal","altitude","velocity","navigation"}
+    local actuator_keys = {"elevator","aileron_left","aileron_right","rudder","throttle","display"}
+    local sensor_count, actuator_count = 0, 0
+    local actuator_names, missing_list = {}, {}
 
-     -- Define which keys are sensors vs actuators
-     local sensor_keys = {"gimbal", "altitude", "velocity", "navigation"}
-     local actuator_keys = {"elevator", "aileron_left", "aileron_right", "rudder", "throttle", "display"}
+    for _, name in ipairs(sensor_keys) do
+        local side = (self.config.peripherals or {})[name]
+        if not side then
+            table.insert(missing_list, name .. "(not configured)")
+        elseif peripheral.isPresent(side) then
+            print("[HW] OK   " .. name .. " -> " .. side .. " (" .. (peripheral.getType(side) or "?") .. ")")
+            sensor_count = sensor_count + 1
+        else
+            table.insert(missing_list, name .. "(" .. side .. ")")
+        end
+    end
 
-     for _, name in ipairs(sensor_keys) do
-         local side = (self.config.peripherals or {})[name]
-         if not side then
-             table.insert(missing_list, name .. "(not configured)")
-         elseif peripheral.isPresent(side) then
-             local ptype = peripheral.getType(side) or "unknown"
-             print("[HW] OK   " .. name .. " -> " .. side .. " (" .. ptype .. ")")
-             sensor_count = sensor_count + 1
-             table.insert(sensor_names, name)
-         else
-             table.insert(missing_list, name .. "(" .. side .. ")")
-         end
-     end
+    for _, name in ipairs(actuator_keys) do
+        local side = (self.config.peripherals or {})[name]
+        if not side then
+            if name == "elevator" or name == "throttle" then
+                table.insert(missing_list, name .. "(not configured)")
+            end
+        elseif peripheral.isPresent(side) then
+            print("[HW] OK   " .. name .. " -> " .. side .. " (" .. (peripheral.getType(side) or "?") .. ")")
+            actuator_count = actuator_count + 1
+            table.insert(actuator_names, name)
+        else
+            table.insert(missing_list, name .. "(" .. side .. ")")
+        end
+    end
 
-     for _, name in ipairs(actuator_keys) do
-         local side = (self.config.peripherals or {})[name]
-         if not side then
-             -- Only warn for critical actuators
-             if name == "elevator" or name == "throttle" then
-                 table.insert(missing_list, name .. "(not configured)")
-             end
-         elseif peripheral.isPresent(side) then
-             local ptype = peripheral.getType(side) or "unknown"
-             print("[HW] OK   " .. name .. " -> " .. side .. " (" .. ptype .. ")")
-             actuator_count = actuator_count + 1
-             table.insert(actuator_names, name)
-         else
-             table.insert(missing_list, name .. "(" .. side .. ")")
-         end
-     end
-
-     print("[HW] Summary: " .. sensor_count .. " sensors, " .. actuator_count .. " actuators ("
-           .. table.concat(actuator_names, ", ") or "none" .. ")")
-
-     if #missing_list > 0 then
-         print("[HW] WARNING - Missing: " .. table.concat(missing_list, ", "))
-     end
+    print("[HW] Summary: " .. sensor_count .. " sensors, " .. actuator_count ..
+          " actuators (" .. table.concat(actuator_names, ", ") .. ")")
+    if #missing_list > 0 then
+        print("[HW] WARNING - Missing: " .. table.concat(missing_list, ", "))
+    end
 end
 
---- Read all sensor data
--- Combines CC: Sable sublevel/aero APIs with peripheral sensors
+-- ============================================================
+-- readSensors (unchanged from original)
+-- ============================================================
 function Hardware:readSensors()
     local now = os.clock()
     local dt = now - self.prev_time
     if dt <= 0 then dt = 0.05 end
     self.prev_time = now
 
-    -- Try CC: Sable sublevel API (works on assembled contraptions)
-    -- All sublevel calls wrapped in pcall to prevent crashes when not on a Sub-Level
     if sublevel and sublevel.isInPlotGrid and sublevel.isInPlotGrid() then
-        -- Altitude from pose (PRIMARY)
-        -- NOTE: getLogicalPose returns {position=vector, orientation=quaternion, ...}
-        -- Must use pose.position.y, NOT pose.y
         if sublevel.getLogicalPose then
             local ok, pose = pcall(sublevel.getLogicalPose)
             if ok and pose and pose.position and pose.position.y then
@@ -173,50 +167,36 @@ function Hardware:readSensors()
                 self.sensors.altitude = alt
             end
         end
-
-        -- Velocity for airspeed
-        -- getVelocity() is PRIMARY: real-time interpolated at computer position, works even outside Sub-Level
-        -- getLinearVelocity() is fallback: cached from last physics tick, may be stale/zero
         if sublevel.getVelocity then
             local ok, vel = pcall(sublevel.getVelocity)
             if ok and vel then
-                local speed = math.sqrt(
-                    (vel.x or 0)^2 + (vel.y or 0)^2 + (vel.z or 0)^2
-                )
+                local speed = math.sqrt((vel.x or 0)^2 + (vel.y or 0)^2 + (vel.z or 0)^2)
                 self.sensors.airspeed = speed
             end
         end
-
-        -- Fallback: use latestLinearVelocity if getVelocity returned zero
         if self.sensors.airspeed == 0 and sublevel.getLinearVelocity then
             local ok, linVel = pcall(sublevel.getLinearVelocity)
             if ok and linVel then
-                local speed = math.sqrt(
-                    (linVel.x or 0)^2 + (linVel.y or 0)^2 + (linVel.z or 0)^2
-                )
+                local speed = math.sqrt((linVel.x or 0)^2 + (linVel.y or 0)^2 + (linVel.z or 0)^2)
                 self.sensors.airspeed = speed
             end
         end
-
-        -- Angular velocity for rate-based PID control
         if sublevel.getAngularVelocity then
             local ok, angVel = pcall(sublevel.getAngularVelocity)
             if ok and angVel then
                 self.sensors.pitch_rate = angVel.x or 0
-                self.sensors.roll_rate = angVel.z or 0
-                self.sensors.yaw_rate = angVel.y or 0
+                self.sensors.roll_rate  = angVel.z or 0
+                self.sensors.yaw_rate   = angVel.y or 0
             end
         end
     end
 
-    -- Read gimbal sensor (attitude)
     if self.peripherals.gimbal and self.peripherals.gimbal.getAngles then
         local angles = self.peripherals.gimbal.getAngles()
         self.sensors.pitch = angles[1] or 0
-        self.sensors.roll = angles[2] or 0
+        self.sensors.roll  = angles[2] or 0
     end
 
-    -- Fallback: Altitude Sensor peripheral (only if sublevel not available)
     if self.sensors.altitude == 0 and self.peripherals.altitude and self.peripherals.altitude.getHeight then
         local alt = self.peripherals.altitude.getHeight()
         self.sensors.vertical_speed = (alt - self.prev_altitude) / dt
@@ -224,259 +204,154 @@ function Hardware:readSensors()
         self.sensors.altitude = alt
     end
 
-    -- Air pressure: PRIMARY source is aero API (CC: Sable aerodynamics)
-    -- aero.getAirPressure() works regardless of whether computer is on a Sub-Level
     if self.has_aero and aero.getAirPressure then
         local ok, pressure = pcall(function()
-            local pose
+            local pos = vector.new(0, 0, 0)
             if sublevel and sublevel.getLogicalPose then
                 local o, p = pcall(sublevel.getLogicalPose)
-                if o and p and p.position then pose = p.position end
+                if o and p and p.position then pos = p.position end
             end
-            local pos = pose or vector.new(0, 0, 0)
             return aero.getAirPressure(pos)
         end)
-        if ok and pressure then
-            self.sensors.air_pressure = pressure
-        end
+        if ok and pressure then self.sensors.air_pressure = pressure end
     end
 
-    -- Fallback: Air pressure from altitude sensor peripheral
     if self.peripherals.altitude and self.peripherals.altitude.getAirPressure then
         local ok, pressure = pcall(self.peripherals.altitude.getAirPressure)
-        if ok and pressure then
-            self.sensors.air_pressure = pressure
-        end
+        if ok and pressure then self.sensors.air_pressure = pressure end
     end
 
-    -- Fallback: Velocity Sensor peripheral (only if sublevel not available)
     if self.sensors.airspeed == 0 and self.peripherals.velocity and self.peripherals.velocity.getVelocity then
         local ok, speed = pcall(self.peripherals.velocity.getVelocity)
-        if ok and speed then
-            self.sensors.airspeed = speed
-        end
+        if ok and speed then self.sensors.airspeed = speed end
     end
 
-    -- Read navigation table (heading) - getRelativeAngle() returns Float (can be nil)
     if self.peripherals.navigation and self.peripherals.navigation.getRelativeAngle then
-        local heading = self.peripherals.navigation.getRelativeAngle()
-        self.sensors.heading = heading or 0
+        self.sensors.heading = self.peripherals.navigation.getRelativeAngle() or 0
     end
 
     return self.sensors
 end
 
---- Read data from CC: Sable sublevel API
--- Provides angular velocity and precise pose data
-function Hardware:readSublevelData()
-    -- Angular velocity for rate-based PID control
-    if sublevel.getAngularVelocity then
-        local angVel = sublevel.getAngularVelocity()
-        self.sensors.pitch_rate = angVel.x or 0
-        self.sensors.roll_rate = angVel.z or 0
-        self.sensors.yaw_rate = angVel.y or 0
-    end
-
-    -- Linear velocity for airspeed fallback
-    if sublevel.getLinearVelocity then
-        local linVel = sublevel.getLinearVelocity()
-        -- Calculate speed magnitude
-        local speed = math.sqrt(
-            (linVel.x or 0)^2 + (linVel.y or 0)^2 + (linVel.z or 0)^2
-        )
-        -- Only use if velocity sensor is not available
-        if not self.peripherals.velocity then
-            self.sensors.airspeed = speed
-        end
-    end
-
-    -- Altitude from pose (fallback)
-    if sublevel.getLogicalPose then
-        local pose = sublevel.getLogicalPose()
-        if pose and pose.y then
-            if not self.peripherals.altitude then
-                self.sensors.altitude = pose.y
-            end
-        end
-    end
-end
-
---- Set throttle (propeller RPM)
--- @param rpm Target RPM (-256 to 256)
+-- ============================================================
+-- Throttle (Rotation Speed Controller — absolute, no delta needed)
+-- ============================================================
 function Hardware:setThrottle(rpm)
     if not self.peripherals.throttle then return end
-
-    -- Clamp to limits
     local max_rpm = self.config.limits.max_throttle_rpm or 256
     local min_rpm = self.config.limits.min_throttle_rpm or 0
     rpm = math.max(min_rpm, math.min(max_rpm, rpm))
-
     if self.peripherals.throttle.setTargetSpeed then
         self.peripherals.throttle.setTargetSpeed(math.floor(rpm))
     end
 end
 
---- Set elevator deflection (delta-based: rotate BY difference from current angle)
--- @param angle Target angle in degrees (positive = nose up)
+-- ============================================================
+-- PATCH [2]: Elevator — uses rotateSmooth
+-- ============================================================
 function Hardware:setElevator(angle)
-    if not self.peripherals.elevator then return end
-
-    -- Clamp to limits
     local max_angle = self.config.limits.max_elevator_angle or 30
-    angle = math.max(-max_angle, math.min(max_angle, angle))
-
-    -- Calculate delta (Sequenced Gearshift rotate() is RELATIVE)
-    local current = self.surface_angles.elevator
-    local delta = angle - current
-    if math.abs(delta) < 0.1 then return end  -- Lowered threshold for finer control
-
-    -- rotate(angle, modifier): angle must be positive integer, modifier integer [-2..2]
-    local rot_angle = math.max(1, math.floor(math.abs(delta) + 0.5))
-    local modifier = delta > 0 and 1 or -1
     local speed_mod = self.config.limits.gearshift_speed_mod or 1
-    -- Clamp modifier to valid range [-2..2], ensure integer
-    local final_mod = math.floor(math.max(-2, math.min(2, modifier * math.abs(speed_mod))))
-
-    if self.peripherals.elevator.rotate then
-        self.peripherals.elevator.rotate(rot_angle, final_mod)
-    end
-    self.surface_angles.elevator = angle
+    self.surface_angles.elevator = self:rotateSmooth(
+        self.peripherals.elevator,
+        angle,
+        self.surface_angles.elevator,
+        max_angle,
+        speed_mod
+    )
 end
 
---- Set aileron deflection (differential, delta-based)
--- @param angle Target aileron angle (positive = right wing down = roll right)
--- Note: Works with single aileron (only left or only right connected)
+-- ============================================================
+-- PATCH [3]: Ailerons — uses rotateSmooth, single-side safe
+-- Differential: left = -angle, right = +angle
+-- ============================================================
 function Hardware:setAilerons(angle)
-    -- Allow single-side operation: only return if BOTH are missing
     if not self.peripherals.aileron_left and not self.peripherals.aileron_right then return end
-
-    -- Clamp to limits
     local max_angle = self.config.limits.max_aileron_angle or 25
-    angle = math.max(-max_angle, math.min(max_angle, angle))
-
     local speed_mod = self.config.limits.gearshift_speed_mod or 1
-    -- Ensure integer for Create Java API
-    local final_mod = math.floor(math.max(-2, math.min(2, math.abs(speed_mod))))
 
-    -- Differential: left and right ailerons move opposite
-    -- Left aileron
     if self.peripherals.aileron_left then
-        local left_delta = -angle - self.surface_angles.aileron_left
-        if math.abs(left_delta) >= 0.1 then
-            local rot_angle = math.max(1, math.floor(math.abs(left_delta) + 0.5))
-            local mod = left_delta > 0 and final_mod or (-final_mod)
-            if self.peripherals.aileron_left.rotate then
-                self.peripherals.aileron_left.rotate(rot_angle, mod)
-            end
-        end
+        self.surface_angles.aileron_left = self:rotateSmooth(
+            self.peripherals.aileron_left,
+            -angle,   -- differential: opposite direction
+            self.surface_angles.aileron_left,
+            max_angle,
+            speed_mod
+        )
     end
 
-    -- Right aileron
     if self.peripherals.aileron_right then
-        local right_delta = angle - self.surface_angles.aileron_right
-        if math.abs(right_delta) >= 0.1 then
-            local rot_angle = math.max(1, math.floor(math.abs(right_delta) + 0.5))
-            local mod = right_delta > 0 and final_mod or (-final_mod)
-            if self.peripherals.aileron_right.rotate then
-                self.peripherals.aileron_right.rotate(rot_angle, mod)
-            end
-        end
+        self.surface_angles.aileron_right = self:rotateSmooth(
+            self.peripherals.aileron_right,
+            angle,
+            self.surface_angles.aileron_right,
+            max_angle,
+            speed_mod
+        )
     end
-
-    self.surface_angles.aileron_left = -angle
-    self.surface_angles.aileron_right = angle
 end
 
---- Set rudder deflection (delta-based)
--- @param angle Target angle in degrees (positive = yaw right)
+-- ============================================================
+-- PATCH [4]: Rudder — uses rotateSmooth
+-- Original bug: modifier was computed as modifier * math.abs(speed_mod)
+-- which collapsed sign info when speed_mod was fractional
+-- ============================================================
 function Hardware:setRudder(angle)
-    if not self.peripherals.rudder then return end
-
-    -- Clamp to limits
     local max_angle = self.config.limits.max_rudder_angle or 20
-    angle = math.max(-max_angle, math.min(max_angle, angle))
-
-    -- Calculate delta
-    local delta = angle - self.surface_angles.rudder
-    if math.abs(delta) < 0.1 then return end
-
-    local rot_angle = math.max(1, math.floor(math.abs(delta) + 0.5))
-    local modifier = delta > 0 and 1 or -1
     local speed_mod = self.config.limits.gearshift_speed_mod or 1
-    -- Ensure integer for Create Java API
-    local final_mod = math.floor(math.max(-2, math.min(2, modifier * math.abs(speed_mod))))
-
-    if self.peripherals.rudder.rotate then
-        self.peripherals.rudder.rotate(rot_angle, final_mod)
-    end
-   self.surface_angles.rudder = angle
+    self.surface_angles.rudder = self:rotateSmooth(
+        self.peripherals.rudder,
+        angle,
+        self.surface_angles.rudder,
+        max_angle,
+        speed_mod
+    )
 end
 
---- Neutralize all control surfaces (center everything)
+-- ============================================================
+-- Utility
+-- ============================================================
 function Hardware:neutralize()
     self:setElevator(0)
     self:setAilerons(0)
     self:setRudder(0)
 end
 
---- Reset surface angle tracking (call after assembly or if angles drift)
 function Hardware:resetSurfaceTracking()
-    self.surface_angles.elevator = 0
-    self.surface_angles.aileron_left = 0
+    self.surface_angles.elevator    = 0
+    self.surface_angles.aileron_left  = 0
     self.surface_angles.aileron_right = 0
-    self.surface_angles.rudder = 0
+    self.surface_angles.rudder      = 0
 end
 
---- Stop throttle
 function Hardware:stopThrottle()
     self:setThrottle(0)
 end
 
---- Update display with current sensor data
--- @param sensors Current sensor readings
--- @param mode Current flight mode
--- @param targets Current target values
+-- ============================================================
+-- Display (unchanged)
+-- ============================================================
 function Hardware:updateDisplay(sensors, mode, targets)
     if not self.peripherals.display then return end
-
     local disp = self.peripherals.display
-
-    -- Clear and write HUD
     disp.clear()
-
-    -- Line 1: Mode and heading
     disp.setCursorPos(1, 1)
     disp.write(string.format("MODE: %-8s HDG: %4.1f", mode, sensors.heading or 0))
-
-    -- Line 2: Airspeed
     disp.setCursorPos(1, 2)
-    local speed_bar = string.rep("#", math.floor((sensors.airspeed or 0) / 10))
-    disp.write(string.format("SPD:  %4.1f  %-16s", sensors.airspeed or 0, speed_bar))
-
-    -- Line 3: Altitude
+    disp.write(string.format("SPD:  %4.1f  %-16s", sensors.airspeed or 0,
+        string.rep("#", math.floor((sensors.airspeed or 0) / 10))))
     disp.setCursorPos(1, 3)
-    local alt_bar = string.rep("|", math.floor((sensors.altitude or 0) / 5))
-    disp.write(string.format("ALT:  %4.1f  %-16s", sensors.altitude or 0, alt_bar))
-
-    -- Line 4: Attitude indicator (simplified)
+    disp.write(string.format("ALT:  %4.1f  %-16s", sensors.altitude or 0,
+        string.rep("|", math.floor((sensors.altitude or 0) / 5))))
     disp.setCursorPos(1, 4)
-    local pitch_str = string.format("PITCH: %+4.1f", sensors.pitch or 0)
-    local roll_str = string.format("ROLL:  %+4.1f", sensors.roll or 0)
-    disp.write(pitch_str .. "  " .. roll_str)
-
-    -- Line 5: Vertical speed
+    disp.write(string.format("PITCH: %+4.1f  ROLL:  %+4.1f", sensors.pitch or 0, sensors.roll or 0))
     disp.setCursorPos(1, 5)
     local vs = sensors.vertical_speed or 0
-    local vs_symbol = vs > 0 and "^" or (vs < 0 and "v" or "-")
-    disp.write(string.format("V/S:  %4.1f %s  PRESSURE: %.2f", math.abs(vs), vs_symbol, sensors.air_pressure or 1))
-
-    -- Line 6: Targets
+    disp.write(string.format("V/S:  %4.1f %s  PRESSURE: %.2f",
+        math.abs(vs), vs > 0 and "^" or (vs < 0 and "v" or "-"), sensors.air_pressure or 1))
     disp.setCursorPos(1, 6)
     disp.write(string.format("TGT: SPD=%-4s ALT=%-4s",
-        targets.airspeed or "---",
-        targets.altitude or "---"))
-
-    -- Push to display
+        targets.airspeed or "---", targets.altitude or "---"))
     disp.update()
 end
 

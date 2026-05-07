@@ -170,22 +170,21 @@ function FC:modeManual()
 end
 
 --- Auto mode: full autopilot with altitude + airspeed hold
---- Phases: TAKEOFF -> CLIMB -> CRUISE
 function FC:modeAuto(targetAirspeed, targetAltitude)
     self.mode = "AUTO"
     self.targets.airspeed = targetAirspeed or CONFIG.defaults.target_airspeed
     self.targets.altitude = targetAltitude or CONFIG.defaults.target_altitude
-    self.targets.roll = 0
+    self.targets.roll    = 0
     self.targets.heading = 0
     self:resetPIDs()
 
     local has_sublevel = sublevel and sublevel.isInPlotGrid and sublevel.isInPlotGrid()
-    local has_gimbal = self.hw.peripherals.gimbal and self.hw.peripherals.gimbal.getAngles
+    local has_gimbal   = self.hw.peripherals.gimbal and self.hw.peripherals.gimbal.getAngles
 
     if has_sublevel then
         print("[FC] OK: Using CC:Sable sublevel API for altitude/velocity data.")
     else
-        print("[FC] WARNING: Not on Sable Sub-Level! Altitude/velocity data from peripherals only.")
+        print("[FC] WARNING: Not on Sable Sub-Level! Altitude/velocity from peripherals only.")
     end
     if not has_gimbal then
         print("[FC] WARNING: No Gimbal Sensor! Pitch/roll control will be blind.")
@@ -193,53 +192,65 @@ function FC:modeAuto(targetAirspeed, targetAltitude)
 
     print("[FC] AUTO mode - Speed: " .. self.targets.airspeed ..
           ", Alt: " .. self.targets.altitude)
-    print("[FC] Phases: takeoff -> climb -> cruise")
+    print("[FC] Phases: TAKEOFF -> CLIMB -> CRUISE")
 
-    local tick = 0
-    local phase = "TAKEOFF"
+    local tick      = 0
+    local phase     = "TAKEOFF"
     local ground_alt = nil
 
     while self.mode == "AUTO" and self.running do
-        tick = tick + 1
+        tick         = tick + 1
         self.log_tick = self.log_tick + 1
 
-        local s = self:readSensors()
+        local s  = self:readSensors()
+        local dt = CONFIG.loop.update_rate
 
         if ground_alt == nil then
             ground_alt = s.altitude
-            print("[AUTO] Ground altitude: " .. string.format("%.1f", ground_alt))
+            print(string.format(
+                "[AUTO] Ground alt (abs Y): %.2f | Target alt (abs Y): %.2f | Rise needed: %.1f",
+                ground_alt,
+                self.targets.altitude,
+                self.targets.altitude - ground_alt
+            ))
+            if self.targets.altitude <= ground_alt + 5 then
+                print("[AUTO] WARNING: target altitude is at or below ground! " ..
+                      "Use 'setalt' to set an absolute Y value above " ..
+                      string.format("%.0f", ground_alt + 20))
+            end
         end
 
         local relative_alt = s.altitude - ground_alt
-        local dt = CONFIG.loop.update_rate
 
-        -- Phase-specific targets
         local tgt = {
             altitude = self.targets.altitude,
             airspeed = self.targets.airspeed,
-            roll = 0,
-            heading = 0,
+            roll     = 0,
+            heading  = 0,
         }
 
-        -- === Phase: TAKEOFF ===
+        -- Phase: TAKEOFF
         if phase == "TAKEOFF" then
-            -- Full throttle, use controller for roll leveling and pitch
             tgt.airspeed = self.targets.airspeed
-            tgt.roll = 0
-            tgt.altitude = ground_alt  -- don't climb yet
+            tgt.roll     = 0
+            tgt.altitude = ground_alt
 
-            -- Transition to CLIMB when airborne
-            if relative_alt > 3 and s.vertical_speed > 0.5 then
+            local airborne = relative_alt > 3 and s.vertical_speed > 0.3
+            local timeout  = tick > 400
+
+            if airborne then
                 phase = "CLIMB"
                 self:resetPIDs()
-                print("[AUTO] Phase: CLIMB (rel_alt=" .. string.format("%.1f", relative_alt) .. ")")
-            elseif tick > 600 then
+                print(string.format("[AUTO] Phase: CLIMB (airborne, rel_alt=%.1f vs=%.2f)",
+                    relative_alt, s.vertical_speed))
+            elseif timeout then
                 phase = "CLIMB"
                 self:resetPIDs()
-                print("[AUTO] Phase: CLIMB (timeout, rel_alt=" .. string.format("%.1f", relative_alt) .. ")")
+                print(string.format("[AUTO] Phase: CLIMB (timeout, rel_alt=%.1f)",
+                    relative_alt))
             end
 
-        -- === Phase: CLIMB ===
+        -- Phase: CLIMB
         elseif phase == "CLIMB" then
             tgt.airspeed = math.max(128, self.targets.airspeed * 0.8)
 
@@ -249,31 +260,38 @@ function FC:modeAuto(targetAirspeed, targetAltitude)
                 print("[AUTO] Phase: CRUISE")
             end
 
-        -- === Phase: CRUISE ===
+        -- Phase: CRUISE
         elseif phase == "CRUISE" then
-            -- Full controller control, no overrides
         end
 
-        -- Run controller to get outputs
+        -- Run controller
         local cmd = self.ctrl:update(tgt, s, dt)
 
         local elevator_cmd = cmd.elevator
-        local aileron_cmd = cmd.aileron
-        local rudder_cmd = cmd.rudder
+        local aileron_cmd  = cmd.aileron
+        local rudder_cmd   = cmd.rudder
         local throttle_cmd = cmd.throttle
 
+        -- Phase overrides
         if phase == "TAKEOFF" then
             throttle_cmd = CONFIG.limits.max_throttle_rpm
-            aileron_cmd = math.max(-15, math.min(15, aileron_cmd))
             elevator_cmd = math.max(-15, math.min(15, elevator_cmd))
+
+        elseif phase == "CLIMB" then
+            if math.abs(s.altitude - self.targets.altitude) > 10 then
+                throttle_cmd = CONFIG.limits.max_throttle_rpm
+            end
         end
 
-        -- Write log: inputs + intermediates + outputs
+        -- Logging
         if self.log_enabled and self.log_file and self.log_tick % 5 == 0 then
-            local log_line = string.format("%d,%s,%+.2f,%+.2f,%.2f,%.2f,%.2f,%+.2f,%+.2f,%+.2f,%+.2f,%+.2f,%+.1f,%+.1f,%+.1f,%+.0f",
+            local log_line = string.format(
+                "%d,%s,%+.2f,%+.2f,%.2f,%.2f,%.2f,%.2f,%+.2f,%+.2f,%+.2f,%+.2f,%+.1f,%+.1f,%+.1f,%+.0f",
                 tick, phase,
-                s.pitch, s.roll, s.altitude, cmd.filteredSpeed, s.vertical_speed,
-                cmd.altError, cmd.pitchError, cmd.rollError, cmd.speedError, cmd.pitchTarget,
+                s.pitch, s.roll,
+                s.altitude, cmd.filteredSpeed, s.vertical_speed,
+                relative_alt,
+                cmd.altError, cmd.pitchError, cmd.rollError, cmd.pitchTarget,
                 elevator_cmd, aileron_cmd, rudder_cmd, throttle_cmd)
             self.log_file.write(log_line .. "\n")
             self.log_file.flush()
@@ -287,9 +305,13 @@ function FC:modeAuto(targetAirspeed, targetAltitude)
 
         self:updateDisplay()
 
+        -- Console status every 20 ticks
         if tick % 20 == 0 then
-            print(string.format("[AUTO] #%d %-12s P:%+.1f R:%+.1f A:%.1f(+%.0f) S:%.1f | Elv:%+.1f Ail:%+.1f Thr:%.0f",
-                tick, phase .. ",", s.pitch, s.roll, s.altitude, relative_alt, cmd.filteredSpeed,
+            print(string.format(
+                "[AUTO] #%-4d %-8s P:%+5.1f R:%+5.1f | AbsAlt:%6.1f RelAlt:%+5.1f VS:%+.2f Spd:%5.1f | Elv:%+5.1f Ail:%+5.1f Thr:%3.0f",
+                tick, phase,
+                s.pitch, s.roll,
+                s.altitude, relative_alt, s.vertical_speed, cmd.filteredSpeed,
                 elevator_cmd, aileron_cmd, throttle_cmd))
         end
 
@@ -674,7 +696,7 @@ function FC:enableLog()
         return
     end
     -- Write CSV header
-    self.log_file.writeLine("tick,phase,pitch,roll,altitude,airspeed,vertical_speed,alt_error,pitch_error,roll_error,speed_error,pitch_target,elevator,aileron,rudder,throttle")
+    self.log_file.writeLine("tick,phase,pitch,roll,altitude,airspeed,vertical_speed,relative_alt,alt_error,pitch_error,roll_error,pitch_target,elevator,aileron,rudder,throttle")
     self.log_file.flush()
     self.log_enabled = true
     self.log_tick = 0
