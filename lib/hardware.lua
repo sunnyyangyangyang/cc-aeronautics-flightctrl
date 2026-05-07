@@ -41,7 +41,6 @@ function Hardware.new(config)
         aileron_left = 0,
         aileron_right = 0,
         rudder = 0,
-        lifter = 0,
     }
 
     return self
@@ -78,9 +77,6 @@ function Hardware:initPeripherals()
     end
     if sides.rudder then
         self.peripherals.rudder = peripheral.wrap(sides.rudder)
-    end
-    if sides.lifter then
-        self.peripherals.lifter = peripheral.wrap(sides.lifter)
     end
 
     -- Throttle (Rotation Speed Controller)
@@ -413,31 +409,7 @@ function Hardware:setRudder(angle)
     if self.peripherals.rudder.rotate then
         self.peripherals.rudder.rotate(rot_angle, final_mod)
     end
-    self.surface_angles.rudder = angle
-end
-
---- Set tail lifter deflection (delta-based)
--- @param angle Target angle in degrees (positive = nose up / lift)
-function Hardware:setLifter(angle)
-    if not self.peripherals.lifter then return end
-
-    -- Clamp to limits (45 degrees max)
-    local max_angle = self.config.limits.max_lifter_angle or 45
-    angle = math.max(-max_angle, math.min(max_angle, angle))
-
-    -- Calculate delta
-    local delta = angle - self.surface_angles.lifter
-    if math.abs(delta) < 0.1 then return end
-
-    local rot_angle = math.max(1, math.floor(math.abs(delta) + 0.5))
-    local modifier = delta > 0 and 1 or -1
-    local speed_mod = self.config.limits.gearshift_speed_mod or 1
-    local final_mod = math.floor(math.max(-2, math.min(2, modifier * math.abs(speed_mod))))
-
-    if self.peripherals.lifter.rotate then
-        self.peripherals.lifter.rotate(rot_angle, final_mod)
-    end
-    self.surface_angles.lifter = angle
+   self.surface_angles.rudder = angle
 end
 
 --- Neutralize all control surfaces (center everything)
@@ -445,7 +417,6 @@ function Hardware:neutralize()
     self:setElevator(0)
     self:setAilerons(0)
     self:setRudder(0)
-    self:setLifter(0)
 end
 
 --- Reset surface angle tracking (call after assembly or if angles drift)
@@ -454,7 +425,6 @@ function Hardware:resetSurfaceTracking()
     self.surface_angles.aileron_left = 0
     self.surface_angles.aileron_right = 0
     self.surface_angles.rudder = 0
-    self.surface_angles.lifter = 0
 end
 
 --- Stop throttle

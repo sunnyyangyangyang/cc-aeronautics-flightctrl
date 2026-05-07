@@ -2,7 +2,7 @@
 -- Adjust these values for your specific aircraft
 
 local CONFIG = {}
-CONFIG.version = "1.1.0"
+CONFIG.version = "1.3.0"
 
 -- Peripheral sides (attach peripherals to top/bottom to avoid Sable #638 bug)
 CONFIG.peripherals = {
@@ -11,11 +11,10 @@ CONFIG.peripherals = {
     velocity = nil,           -- Velocity Sensor (facing forward)
     navigation = nil,        -- Navigation Table (optional, for heading)
     -- Control actuators via Sequenced Gearshift
-    elevator = "Create_SequencedGearshift_11",          -- Sequenced Gearshift -> Elevator Swivel Bearing
+    elevator = "Create_SequencedGearshift_12",          -- Sequenced Gearshift -> Elevator (Tail)
     aileron_left = "Create_SequencedGearshift_6",       -- Sequenced Gearshift -> Left Aileron
     aileron_right = "Create_SequencedGearshift_7",    -- Sequenced Gearshift -> Right Aileron
     rudder = "right",              -- Sequenced Gearshift -> Rudder (optional)
-    lifter = "Create_SequencedGearshift_12",          -- Sequenced Gearshift -> Tail Lifter
     -- Throttle control
     throttle = "Create_RotationSpeedController_1",           -- Rotation Speed Controller for propeller
     -- Display
@@ -30,7 +29,6 @@ CONFIG.limits = {
     max_elevator_angle = 45,     -- Max elevator deflection (degrees), up/down
     max_aileron_angle = 25,      -- Max aileron deflection (degrees)
     max_rudder_angle = 45,       -- Max rudder deflection (degrees), left/right
-    max_lifter_angle = 45,       -- Max tail lifter deflection (degrees), up/down
     gearshift_speed_mod = 1,     -- Sequenced Gearshift speed modifier (-2..2)
 }
 
@@ -46,14 +44,14 @@ CONFIG.pid = {
         output_min = -256,
         output_max = 256,
     },
-    -- Pitch PID: controls altitude via elevator
+    -- Pitch PID: controls altitude via elevator (sole pitch authority)
     pitch = {
-        kp = 0.8,
-        ki = 0.02,
-        kd = 0.3,
-        integral_max = 50,
-        output_min = -30,
-        output_max = 30,
+        kp = 1.0,
+        ki = 0.03,
+        kd = 0.4,
+        integral_max = 80,
+        output_min = -45,
+        output_max = 45,
     },
     -- Roll PID: controls bank angle via ailerons
     roll = {
@@ -64,12 +62,12 @@ CONFIG.pid = {
         output_min = -25,
         output_max = 25,
     },
-    -- Yaw PID: controls heading via rudder
+    -- Yaw PID: controls heading via rudder (now uses yaw_rate damping)
     yaw = {
-        kp = 0.3,
-        ki = 0.005,
-        kd = 0.1,
-        integral_max = 30,
+        kp = 3.0,
+        ki = 0.0,
+        kd = 0.0,
+        integral_max = 10,
         output_min = -20,
         output_max = 20,
     },
