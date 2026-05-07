@@ -13,6 +13,8 @@ function Hardware.new(config)
 
     -- Raw peripherals
     self.peripherals = {}
+    -- API availability
+    self.has_aero = false
     -- Parsed sensor data
     self.sensors = {
         pitch = 0,               -- Pitch angle (degrees)
@@ -87,6 +89,17 @@ function Hardware:initPeripherals()
         self.peripherals.display = peripheral.wrap(sides.display)
     end
 
+    -- Check aero/aerodynamics API availability
+    if aero and aero.getAirPressure then
+        self.has_aero = true
+        print("[HW] OK   aero API available")
+    end
+
+    -- Check sublevel API availability
+    if sublevel and sublevel.isInPlotGrid then
+        print("[HW] OK   sublevel API available")
+    end
+
     -- Print detailed status for each peripheral
      local sensor_count = 0
      local actuator_count = 0
@@ -138,7 +151,7 @@ function Hardware:initPeripherals()
 end
 
 --- Read all sensor data
--- Combines CC: Sable sublevel API with peripheral sensors
+-- Combines CC: Sable sublevel/aero APIs with peripheral sensors
 function Hardware:readSensors()
     local now = os.clock()
     local dt = now - self.prev_time
@@ -146,34 +159,53 @@ function Hardware:readSensors()
     self.prev_time = now
 
     -- Try CC: Sable sublevel API (works on assembled contraptions)
-    -- Always read sublevel data: altitude/speed are PRIMARY sources
+    -- All sublevel calls wrapped in pcall to prevent crashes when not on a Sub-Level
     if sublevel and sublevel.isInPlotGrid and sublevel.isInPlotGrid() then
         -- Altitude from pose (PRIMARY)
+        -- NOTE: getLogicalPose returns {position=vector, orientation=quaternion, ...}
+        -- Must use pose.position.y, NOT pose.y
         if sublevel.getLogicalPose then
-            local pose = sublevel.getLogicalPose()
-            if pose and pose.y then
-                local alt = pose.y
+            local ok, pose = pcall(sublevel.getLogicalPose)
+            if ok and pose and pose.position and pose.position.y then
+                local alt = pose.position.y
                 self.sensors.vertical_speed = (alt - self.prev_altitude) / dt
                 self.prev_altitude = alt
                 self.sensors.altitude = alt
             end
         end
 
-        -- Linear velocity for airspeed (PRIMARY)
-        if sublevel.getLinearVelocity then
-            local linVel = sublevel.getLinearVelocity()
-            local speed = math.sqrt(
-                (linVel.x or 0)^2 + (linVel.y or 0)^2 + (linVel.z or 0)^2
-            )
-            self.sensors.airspeed = speed
+        -- Velocity for airspeed
+        -- getVelocity() is PRIMARY: real-time interpolated at computer position, works even outside Sub-Level
+        -- getLinearVelocity() is fallback: cached from last physics tick, may be stale/zero
+        if sublevel.getVelocity then
+            local ok, vel = pcall(sublevel.getVelocity)
+            if ok and vel then
+                local speed = math.sqrt(
+                    (vel.x or 0)^2 + (vel.y or 0)^2 + (vel.z or 0)^2
+                )
+                self.sensors.airspeed = speed
+            end
+        end
+
+        -- Fallback: use latestLinearVelocity if getVelocity returned zero
+        if self.sensors.airspeed == 0 and sublevel.getLinearVelocity then
+            local ok, linVel = pcall(sublevel.getLinearVelocity)
+            if ok and linVel then
+                local speed = math.sqrt(
+                    (linVel.x or 0)^2 + (linVel.y or 0)^2 + (linVel.z or 0)^2
+                )
+                self.sensors.airspeed = speed
+            end
         end
 
         -- Angular velocity for rate-based PID control
         if sublevel.getAngularVelocity then
-            local angVel = sublevel.getAngularVelocity()
-            self.sensors.pitch_rate = angVel.x or 0
-            self.sensors.roll_rate = angVel.z or 0
-            self.sensors.yaw_rate = angVel.y or 0
+            local ok, angVel = pcall(sublevel.getAngularVelocity)
+            if ok and angVel then
+                self.sensors.pitch_rate = angVel.x or 0
+                self.sensors.roll_rate = angVel.z or 0
+                self.sensors.yaw_rate = angVel.y or 0
+            end
         end
     end
 
@@ -192,14 +224,37 @@ function Hardware:readSensors()
         self.sensors.altitude = alt
     end
 
-    -- Air pressure from altitude sensor
+    -- Air pressure: PRIMARY source is aero API (CC: Sable aerodynamics)
+    -- aero.getAirPressure() works regardless of whether computer is on a Sub-Level
+    if self.has_aero and aero.getAirPressure then
+        local ok, pressure = pcall(function()
+            local pose
+            if sublevel and sublevel.getLogicalPose then
+                local o, p = pcall(sublevel.getLogicalPose)
+                if o and p and p.position then pose = p.position end
+            end
+            local pos = pose or vector.new(0, 0, 0)
+            return aero.getAirPressure(pos)
+        end)
+        if ok and pressure then
+            self.sensors.air_pressure = pressure
+        end
+    end
+
+    -- Fallback: Air pressure from altitude sensor peripheral
     if self.peripherals.altitude and self.peripherals.altitude.getAirPressure then
-        self.sensors.air_pressure = self.peripherals.altitude.getAirPressure()
+        local ok, pressure = pcall(self.peripherals.altitude.getAirPressure)
+        if ok and pressure then
+            self.sensors.air_pressure = pressure
+        end
     end
 
     -- Fallback: Velocity Sensor peripheral (only if sublevel not available)
     if self.sensors.airspeed == 0 and self.peripherals.velocity and self.peripherals.velocity.getVelocity then
-        self.sensors.airspeed = self.peripherals.velocity.getVelocity()
+        local ok, speed = pcall(self.peripherals.velocity.getVelocity)
+        if ok and speed then
+            self.sensors.airspeed = speed
+        end
     end
 
     -- Read navigation table (heading) - getRelativeAngle() returns Float (can be nil)
