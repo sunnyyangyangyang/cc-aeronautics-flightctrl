@@ -66,7 +66,7 @@ function FC:init()
 
     print("")
     print("------------------------------------------------")
-    print("|   Aeronautics Flight Controller v1.0        |")
+    print(string.format("|   Aeronautics Flight Controller v%-4s |", CONFIG.version))
     print("|   Type 'help' for commands                   |")
     print("------------------------------------------------")
     print("")
@@ -263,24 +263,24 @@ function FC:modeAuto(targetAirspeed, targetAltitude)
             -- Full controller control, no overrides
         end
 
-        -- Run controller to get outputs
-        local ctrl = self.ctrl
-        local cmd = ctrl:update(tgt, s, dt)
+        -- Run controller to get outputs (skip GROUND_ROLL to avoid PID windup)
+        local cmd
+        if phase == "GROUND_ROLL" then
+            cmd = {
+                elevator = 0, aileron = 0, rudder = 0, throttle = CONFIG.limits.max_throttle_rpm, lifter = 0,
+                filteredSpeed = s.airspeed, altError = 0, pitchError = 0, rollError = 0, speedError = 0, pitchTarget = 0,
+            }
+        else
+            cmd = self.ctrl:update(tgt, s, dt)
+        end
 
-        -- Phase-specific overrides
         local elevator_cmd = cmd.elevator
         local aileron_cmd = cmd.aileron
         local rudder_cmd = cmd.rudder
         local throttle_cmd = cmd.throttle
         local lifter_cmd = cmd.lifter
 
-        if phase == "GROUND_ROLL" then
-            throttle_cmd = CONFIG.limits.max_throttle_rpm
-            elevator_cmd = 0
-            aileron_cmd = 0
-            rudder_cmd = 0
-            lifter_cmd = 0
-        elseif phase == "TAKEOFF" then
+        if phase == "TAKEOFF" then
             throttle_cmd = CONFIG.limits.max_throttle_rpm
             -- Limit authority during takeoff
             aileron_cmd = math.max(-15, math.min(15, aileron_cmd))

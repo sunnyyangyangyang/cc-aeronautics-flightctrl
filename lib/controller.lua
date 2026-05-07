@@ -58,7 +58,7 @@ function Controller.new(config)
 
     -- Sensor filters
     self.filtered_airspeed = 0
-    self.airspeed_alpha = 0.3
+    self.airspeed_alpha = 0.1
     self.max_airspeed = 500
 
     -- Output rate limiters (degrees/s)
@@ -144,10 +144,10 @@ function Controller:update(targets, sensors, dt)
     local max_lifter = self.config.limits.max_lifter_angle or 45
     lifterCmd = math.max(-max_lifter, math.min(max_lifter, lifterCmd))
 
-    -- Stall protection
+    -- Stall protection: pitch UP to increase angle of attack, max throttle
     if spd < self.config.safety.stall_speed and spd > 0 then
-        elevatorCmd = math.min(elevatorCmd, -10)
-        lifterCmd = math.min(lifterCmd, -8)
+        elevatorCmd = math.max(elevatorCmd, 10)
+        lifterCmd = math.max(lifterCmd, 8)
         throttleCmd = math.max(throttleCmd, 192)
     end
 

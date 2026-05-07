@@ -2,6 +2,7 @@
 -- Adjust these values for your specific aircraft
 
 local CONFIG = {}
+CONFIG.version = "1.1.0"
 
 -- Peripheral sides (attach peripherals to top/bottom to avoid Sable #638 bug)
 CONFIG.peripherals = {
@@ -47,9 +48,9 @@ CONFIG.pid = {
     },
     -- Pitch PID: controls altitude via elevator
     pitch = {
-        kp = 0.4,
-        ki = 0.01,
-        kd = 0.2,
+        kp = 0.8,
+        ki = 0.02,
+        kd = 0.3,
         integral_max = 50,
         output_min = -30,
         output_max = 30,
