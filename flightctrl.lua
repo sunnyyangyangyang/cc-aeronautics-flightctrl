@@ -19,6 +19,7 @@
 -- Load modules
 local PID = require("lib/pid")
 local Hardware = require("lib/hardware")
+local Controller = require("lib/controller")
 local CONFIG = require("config/settings")
 
 -- ============================================================
@@ -31,21 +32,8 @@ function FC:init()
     self.hw = Hardware.new(CONFIG)
     self.hw:initPeripherals()
 
-    -- Initialize PID controllers from config
-    local tp = CONFIG.pid.throttle
-    self.pid_throttle = PID.new(tp.kp, tp.ki, tp.kd, tp.integral_max, tp.output_min, tp.output_max)
-
-    local pp = CONFIG.pid.pitch
-    self.pid_pitch = PID.new(pp.kp, pp.ki, pp.kd, pp.integral_max, pp.output_min, pp.output_max)
-
-    local rp = CONFIG.pid.roll
-    self.pid_roll = PID.new(rp.kp, rp.ki, rp.kd, rp.integral_max, rp.output_min, rp.output_max)
-
-    local yp = CONFIG.pid.yaw
-    self.pid_yaw = PID.new(yp.kp, yp.ki, yp.kd, yp.integral_max, yp.output_min, yp.output_max)
-
-    local ap = CONFIG.pid.altitude
-    self.pid_altitude = PID.new(ap.kp, ap.ki, ap.kd, ap.integral_max, ap.output_min, ap.output_max)
+    -- Initialize flight controller (abstracted PID cascade)
+    self.ctrl = Controller.new(CONFIG)
 
     -- Flight state
     self.mode = "IDLE"          -- IDLE, MANUAL, AUTO, HOVER, CRUISE, LANDING, EMERGENCY
@@ -188,9 +176,9 @@ function FC:modeAuto(targetAirspeed, targetAltitude)
     self.targets.airspeed = targetAirspeed or CONFIG.defaults.target_airspeed
     self.targets.altitude = targetAltitude or CONFIG.defaults.target_altitude
     self.targets.roll = 0
+    self.targets.heading = 0
     self:resetPIDs()
 
-    -- Check data sources (sublevel API is PRIMARY, peripherals are fallback)
     local has_sublevel = sublevel and sublevel.isInPlotGrid and sublevel.isInPlotGrid()
     local has_gimbal = self.hw.peripherals.gimbal and self.hw.peripherals.gimbal.getAngles
 
@@ -209,48 +197,33 @@ function FC:modeAuto(targetAirspeed, targetAltitude)
 
     local tick = 0
     local phase = "GROUND_ROLL"
-    local ground_alt = nil          -- Ground altitude recorded at start of GROUND_ROLL
-    local filtered_airspeed = 0     -- Low-pass filtered airspeed to reject spikes
+    local ground_alt = nil
 
     while self.mode == "AUTO" and self.running do
         tick = tick + 1
         self.log_tick = self.log_tick + 1
 
-        -- Read sensors
         local s = self:readSensors()
 
-        -- Filter airspeed: low-pass to reject physics spikes (e.g. 2338 glitch)
-        -- Also hard-clamp to sane range (0..500 blocks/s)
-        local raw_speed = math.min(s.airspeed, 500)
-        filtered_airspeed = 0.7 * filtered_airspeed + 0.3 * raw_speed
-        s.airspeed = filtered_airspeed
-
-        -- Record ground altitude on first tick
         if ground_alt == nil then
             ground_alt = s.altitude
             print("[AUTO] Ground altitude: " .. string.format("%.1f", ground_alt))
         end
 
         local relative_alt = s.altitude - ground_alt
+        local dt = CONFIG.loop.update_rate
 
-        local elevator_cmd = 0
-        local aileron_cmd = 0
-        local rudder_cmd = 0
-        local throttle_cmd = 0
-        local stall_protected = false
-        local ground_protected = false
-        local log_pitch_err = 0
-        local log_roll_err = 0
+        -- Phase-specific targets
+        local tgt = {
+            altitude = self.targets.altitude,
+            airspeed = self.targets.airspeed,
+            roll = 0,
+            heading = 0,
+        }
 
         -- === Phase: GROUND_ROLL ===
-        -- Accelerate on ground. Keep wings level, nose neutral. Full throttle.
         if phase == "GROUND_ROLL" then
-            throttle_cmd = CONFIG.limits.max_throttle_rpm
-            elevator_cmd = 0
-            aileron_cmd = 0
-            rudder_cmd = 0
-
-            -- Transition to TAKEOFF when airspeed > 64 (or after 10s timeout)
+            -- Full throttle, neutral surfaces
             if s.airspeed > 64 or tick > 200 then
                 phase = "TAKEOFF"
                 self:resetPIDs()
@@ -258,62 +231,27 @@ function FC:modeAuto(targetAirspeed, targetAltitude)
             end
 
         -- === Phase: TAKEOFF ===
-        -- Gentle pitch up to lift off, then transition when clearly airborne
         elseif phase == "TAKEOFF" then
-            throttle_cmd = CONFIG.limits.max_throttle_rpm
+            -- Use controller for roll leveling, override pitch and throttle
+            tgt.airspeed = self.targets.airspeed
+            tgt.roll = 0
+            tgt.altitude = ground_alt  -- don't climb yet
 
-            -- Level wings with CLAMPED error to prevent overreaction
-            if has_gimbal then
-                log_roll_err = 0 - s.roll
-                local clamped_roll_err = math.max(-15, math.min(15, log_roll_err))
-                aileron_cmd = self.pid_roll:update(clamped_roll_err, CONFIG.loop.update_rate)
-                aileron_cmd = math.max(-15, math.min(15, aileron_cmd))  -- Limit aileron authority during takeoff
-            end
-
-            -- Gentle nose-up (fixed target)
-            local pitch_target = -5
-            if has_gimbal then
-                log_pitch_err = pitch_target - s.pitch
-                local clamped_pitch_err = math.max(-20, math.min(20, log_pitch_err))
-                elevator_cmd = self.pid_pitch:update(clamped_pitch_err, CONFIG.loop.update_rate)
-                elevator_cmd = math.max(-15, math.min(15, elevator_cmd))  -- Symmetric cap
-            end
-
-            -- Transition to CLIMB when clearly airborne:
-            -- Relative altitude gain > 3 blocks AND positive vertical speed
+            -- Transition to CLIMB when airborne
             if relative_alt > 3 and s.vertical_speed > 0.5 then
                 phase = "CLIMB"
                 self:resetPIDs()
                 print("[AUTO] Phase: CLIMB (rel_alt=" .. string.format("%.1f", relative_alt) .. ")")
             elseif tick > 600 then
-                -- Safety: if stuck in TAKEOFF for too long, force transition
                 phase = "CLIMB"
                 self:resetPIDs()
                 print("[AUTO] Phase: CLIMB (timeout, rel_alt=" .. string.format("%.1f", relative_alt) .. ")")
             end
 
         -- === Phase: CLIMB ===
-        -- Climb to target altitude
         elseif phase == "CLIMB" then
-            throttle_cmd = math.max(128, CONFIG.limits.max_throttle_rpm * 0.75)
+            tgt.airspeed = math.max(128, self.targets.airspeed * 0.8)
 
-            -- Altitude PID -> pitch target
-            local alt_error = self.targets.altitude - s.altitude
-            local pitch_correction = self.pid_altitude:update(alt_error, CONFIG.loop.update_rate)
-            pitch_correction = math.max(-10, math.min(15, pitch_correction))
-
-            if has_gimbal then
-                log_pitch_err = pitch_correction - s.pitch
-                elevator_cmd = self.pid_pitch:update(log_pitch_err, CONFIG.loop.update_rate)
-            end
-
-            -- Level wings
-            if has_gimbal then
-                log_roll_err = 0 - s.roll
-                aileron_cmd = self.pid_roll:update(log_roll_err, CONFIG.loop.update_rate)
-            end
-
-            -- Transition to CRUISE when within 5 blocks of target
             if math.abs(s.altitude - self.targets.altitude) < 5 then
                 phase = "CRUISE"
                 self:resetPIDs()
@@ -321,63 +259,42 @@ function FC:modeAuto(targetAirspeed, targetAltitude)
             end
 
         -- === Phase: CRUISE ===
-        -- Full PID control
         elseif phase == "CRUISE" then
-            -- Altitude PID (outer loop)
-            local alt_error = self.targets.altitude - s.altitude
-            local pitch_correction = self.pid_altitude:update(alt_error, CONFIG.loop.update_rate)
-            pitch_correction = math.max(-10, math.min(10, pitch_correction))
-
-            if has_gimbal then
-                log_pitch_err = pitch_correction - s.pitch
-                elevator_cmd = self.pid_pitch:update(log_pitch_err, CONFIG.loop.update_rate)
-            end
-
-            -- Roll PID
-            if has_gimbal then
-                log_roll_err = self.targets.roll - s.roll
-                aileron_cmd = self.pid_roll:update(log_roll_err, CONFIG.loop.update_rate)
-            end
-
-            -- Yaw PID
-            rudder_cmd = 0
-
-            -- Throttle PID
-            local speed_error = self.targets.airspeed - s.airspeed
-            throttle_cmd = self.pid_throttle:update(speed_error, CONFIG.loop.update_rate)
-
-            -- Stall protection
-            if s.airspeed < CONFIG.safety.stall_speed and s.airspeed > 0 then
-                elevator_cmd = math.min(elevator_cmd, -10)
-                throttle_cmd = math.max(throttle_cmd, 192)
-                stall_protected = true
-            end
-
-            -- Ground proximity
-            if relative_alt < CONFIG.safety.ground_proximity_alt and relative_alt > 0 then
-                if s.vertical_speed < -2 then
-                    elevator_cmd = math.max(elevator_cmd, 15)
-                    ground_protected = true
-                end
-            end
+            -- Full controller control, no overrides
         end
 
-        -- Clamp outputs
-        elevator_cmd = math.max(-CONFIG.limits.max_elevator_angle, math.min(CONFIG.limits.max_elevator_angle, elevator_cmd))
-        aileron_cmd = math.max(-CONFIG.limits.max_aileron_angle, math.min(CONFIG.limits.max_aileron_angle, aileron_cmd))
-        rudder_cmd = math.max(-CONFIG.limits.max_rudder_angle, math.min(CONFIG.limits.max_rudder_angle, rudder_cmd))
-        throttle_cmd = math.max(CONFIG.limits.min_throttle_rpm, math.min(CONFIG.limits.max_throttle_rpm, throttle_cmd))
+        -- Run controller to get outputs
+        local ctrl = self.ctrl
+        local cmd = ctrl:update(tgt, s, dt)
 
-        -- Write log (every 5 ticks = ~250ms)
+        -- Phase-specific overrides
+        local elevator_cmd = cmd.elevator
+        local aileron_cmd = cmd.aileron
+        local rudder_cmd = cmd.rudder
+        local throttle_cmd = cmd.throttle
+        local lifter_cmd = cmd.lifter
+
+        if phase == "GROUND_ROLL" then
+            throttle_cmd = CONFIG.limits.max_throttle_rpm
+            elevator_cmd = 0
+            aileron_cmd = 0
+            rudder_cmd = 0
+            lifter_cmd = 0
+        elseif phase == "TAKEOFF" then
+            throttle_cmd = CONFIG.limits.max_throttle_rpm
+            -- Limit authority during takeoff
+            aileron_cmd = math.max(-15, math.min(15, aileron_cmd))
+            elevator_cmd = math.max(-15, math.min(15, elevator_cmd))
+            lifter_cmd = math.max(-12, math.min(12, lifter_cmd))
+        end
+
+        -- Write log: inputs + intermediates + outputs
         if self.log_enabled and self.log_file and self.log_tick % 5 == 0 then
-            local alt_error = self.targets.altitude - s.altitude
-            local speed_error = self.targets.airspeed - s.airspeed
-            local log_line = string.format("%d,%s,%+.2f,%+.2f,%.2f,%.2f,%.2f,%+.2f,%+.2f,%+.2f,%+.2f,%.1f,%.1f,%.1f,%.0f,%s,%s",
-                tick, phase, s.pitch, s.roll, s.altitude, s.airspeed, s.vertical_speed,
-                alt_error, log_pitch_err, log_roll_err, speed_error,
-                elevator_cmd, aileron_cmd, rudder_cmd, throttle_cmd,
-                stall_protected and "STALL" or "no",
-                ground_protected and "GROUND" or "no")
+            local log_line = string.format("%d,%s,%+.2f,%+.2f,%.2f,%.2f,%.2f,%+.2f,%+.2f,%+.2f,%+.2f,%+.2f,%+.1f,%+.1f,%+.1f,%+.1f,%+.0f",
+                tick, phase,
+                s.pitch, s.roll, s.altitude, cmd.filteredSpeed, s.vertical_speed,
+                cmd.altError, cmd.pitchError, cmd.rollError, cmd.speedError, cmd.pitchTarget,
+                elevator_cmd, aileron_cmd, rudder_cmd, lifter_cmd, throttle_cmd)
             self.log_file.write(log_line .. "\n")
             self.log_file.flush()
         end
@@ -387,17 +304,17 @@ function FC:modeAuto(targetAirspeed, targetAltitude)
         self.hw:setElevator(elevator_cmd)
         self.hw:setAilerons(aileron_cmd)
         self.hw:setRudder(rudder_cmd)
+        self.hw:setLifter(lifter_cmd)
 
         self:updateDisplay()
 
-        -- Debug: print status every 20 ticks (~1 second)
         if tick % 20 == 0 then
-            print(string.format("[AUTO] #%d %-12s P:%+.1f R:%+.1f A:%.1f(+%.0f) S:%.1f | Elv:%+.1f Ail:%+.1f Rud:%+.1f Thr:%.0f",
-                tick, phase .. ",", s.pitch, s.roll, s.altitude, relative_alt, s.airspeed,
-                elevator_cmd, aileron_cmd, rudder_cmd, throttle_cmd))
+            print(string.format("[AUTO] #%d %-12s P:%+.1f R:%+.1f A:%.1f(+%.0f) S:%.1f | Elv:%+.1f Ail:%+.1f Lft:%+.1f Thr:%.0f",
+                tick, phase .. ",", s.pitch, s.roll, s.altitude, relative_alt, cmd.filteredSpeed,
+                elevator_cmd, aileron_cmd, lifter_cmd, throttle_cmd))
         end
 
-        os.sleep(CONFIG.loop.update_rate)
+        os.sleep(dt)
     end
 end
 
@@ -406,7 +323,6 @@ function FC:modeHover(targetAltitude)
     self.targets.altitude = targetAltitude or self.hw.sensors.altitude
     self.targets.airspeed = 0
     self:modeAuto(0, self.targets.altitude)
-    -- Override mode name
     self.mode = "HOVER"
     print("[FC] HOVER mode - maintaining altitude: " .. self.targets.altitude)
 
@@ -420,27 +336,14 @@ function FC:modeHover(targetAltitude)
         end
 
         local s = self:readSensors()
+        local tgt = { altitude = self.targets.altitude, airspeed = 0, roll = 0, heading = 0 }
+        local cmd = self.ctrl:update(tgt, s, CONFIG.loop.update_rate)
 
-        -- Minimal throttle to maintain altitude
-        local alt_error = self.targets.altitude - s.altitude
-        local pitch_correction = self.pid_altitude:update(alt_error, CONFIG.loop.update_rate)
-
-        local pitch_error = pitch_correction - s.pitch
-        local elevator_cmd = self.pid_pitch:update(pitch_error, CONFIG.loop.update_rate)
-
-        -- Level wings
-        local roll_error = 0 - s.roll
-        local aileron_cmd = self.pid_roll:update(roll_error, CONFIG.loop.update_rate)
-
-        -- Minimal thrust
-        local throttle_cmd = CONFIG.limits.idle_throttle_rpm + alt_error * 2
-        throttle_cmd = math.max(CONFIG.limits.min_throttle_rpm,
-            math.min(CONFIG.limits.max_throttle_rpm, throttle_cmd))
-
-        self.hw:setThrottle(throttle_cmd)
-        self.hw:setElevator(elevator_cmd)
-        self.hw:setAilerons(aileron_cmd)
-        self.hw:setRudder(0)
+        self.hw:setThrottle(cmd.throttle)
+        self.hw:setElevator(cmd.elevator)
+        self.hw:setAilerons(cmd.aileron)
+        self.hw:setRudder(cmd.rudder)
+        self.hw:setLifter(cmd.lifter)
 
         self:updateDisplay()
     end
@@ -452,7 +355,6 @@ function FC:modeLand()
     self:resetPIDs()
     print("[FC] LANDING - initiating descent...")
 
-    -- Phase 1: Reduce speed
     print("[FC] Phase 1: Reducing airspeed...")
     local current_throttle = self.manual.throttle or CONFIG.limits.idle_throttle_rpm
     for rpm = current_throttle, 32, -4 do
@@ -463,39 +365,28 @@ function FC:modeLand()
         os.sleep(0.15)
     end
 
-    -- Phase 2: Gentle descent
     print("[FC] Phase 2: Descending...")
     while self.running and self.mode == "LANDING" do
         os.sleep(CONFIG.loop.update_rate)
         local s = self:readSensors()
 
-        -- Near ground?
         if s.altitude < 3 then
             print("[FC] Touchdown imminent!")
             break
         end
 
-        -- Gentle nose-down for descent
-        local descent_pitch = math.max(-15, -(s.altitude / 5))
-        local pitch_error = descent_pitch - s.pitch
-        local elevator_cmd = self.pid_pitch:update(pitch_error, CONFIG.loop.update_rate)
+        local tgt = { altitude = 0, airspeed = 32, roll = 0, heading = 0 }
+        local cmd = self.ctrl:update(tgt, s, CONFIG.loop.update_rate)
 
-        -- Keep wings level
-        local roll_error = 0 - s.roll
-        local aileron_cmd = self.pid_roll:update(roll_error, CONFIG.loop.update_rate)
-
-        -- Maintain minimum safe speed
-        local throttle_cmd = math.max(32, s.airspeed - 2)
-
-        self.hw:setThrottle(throttle_cmd)
-        self.hw:setElevator(elevator_cmd)
-        self.hw:setAilerons(aileron_cmd)
-        self.hw:setRudder(0)
+        self.hw:setThrottle(cmd.throttle)
+        self.hw:setElevator(cmd.elevator)
+        self.hw:setAilerons(cmd.aileron)
+        self.hw:setRudder(cmd.rudder)
+        self.hw:setLifter(cmd.lifter)
 
         self:updateDisplay()
     end
 
-    -- Phase 3: Stop
     print("[FC] Phase 3: Stopping...")
     self.hw:setThrottle(0)
     self.hw:neutralize()
@@ -517,16 +408,14 @@ function FC:emergencyStop()
     self.hw:resetSurfaceTracking()
 
     if CONFIG.safety.auto_level_on_emergency then
-        -- Try to level wings before stopping
         local s = self:readSensors()
         if math.abs(s.roll) > 10 then
-            -- Quick level
-            self.pid_roll:reset()
+            self.ctrl:reset()
             for i = 1, 10 do
                 s = self:readSensors()
-                local roll_error = 0 - s.roll
-                local aileron_cmd = self.pid_roll:update(roll_error, 0.1)
-                self.hw:setAilerons(aileron_cmd)
+                local tgt = { altitude = s.altitude, airspeed = 0, roll = 0, heading = 0 }
+                local cmd = self.ctrl:update(tgt, s, 0.1)
+                self.hw:setAilerons(cmd.aileron)
                 os.sleep(0.1)
             end
         end
@@ -538,11 +427,7 @@ function FC:emergencyStop()
 end
 
 function FC:resetPIDs()
-    self.pid_throttle:reset()
-    self.pid_pitch:reset()
-    self.pid_roll:reset()
-    self.pid_yaw:reset()
-    self.pid_altitude:reset()
+    self.ctrl:reset()
 end
 
 -- ============================================================
@@ -812,7 +697,7 @@ function FC:enableLog()
         return
     end
     -- Write CSV header
-    self.log_file.writeLine("tick,pitch,roll,altitude,airspeed,vertical_speed,alt_error,pitch_error,roll_error,speed_error,elevator_cmd,aileron_cmd,rudder_cmd,throttle_cmd,stall_protected,ground_protected")
+    self.log_file.writeLine("tick,phase,pitch,roll,altitude,airspeed,vertical_speed,alt_error,pitch_error,roll_error,speed_error,pitch_target,elevator,aileron,rudder,lifter,throttle")
     self.log_file.flush()
     self.log_enabled = true
     self.log_tick = 0

@@ -14,6 +14,7 @@ CONFIG.peripherals = {
     aileron_left = "Create_SequencedGearshift_6",       -- Sequenced Gearshift -> Left Aileron
     aileron_right = "Create_SequencedGearshift_7",    -- Sequenced Gearshift -> Right Aileron
     rudder = "right",              -- Sequenced Gearshift -> Rudder (optional)
+    lifter = "Create_SequencedGearshift_12",          -- Sequenced Gearshift -> Tail Lifter
     -- Throttle control
     throttle = "Create_RotationSpeedController_1",           -- Rotation Speed Controller for propeller
     -- Display
@@ -28,6 +29,7 @@ CONFIG.limits = {
     max_elevator_angle = 45,     -- Max elevator deflection (degrees), up/down
     max_aileron_angle = 25,      -- Max aileron deflection (degrees)
     max_rudder_angle = 45,       -- Max rudder deflection (degrees), left/right
+    max_lifter_angle = 45,       -- Max tail lifter deflection (degrees), up/down
     gearshift_speed_mod = 1,     -- Sequenced Gearshift speed modifier (-2..2)
 }
 
