@@ -10,12 +10,12 @@ CONFIG.peripherals = {
     velocity = nil,           -- Velocity Sensor (facing forward)
     navigation = nil,        -- Navigation Table (optional, for heading)
     -- Control actuators via Sequenced Gearshift
-    elevator = "Create_SequencedGearshift_10",          -- Sequenced Gearshift -> Elevator Swivel Bearing
+    elevator = "Create_SequencedGearshift_11",          -- Sequenced Gearshift -> Elevator Swivel Bearing
     aileron_left = "Create_SequencedGearshift_6",       -- Sequenced Gearshift -> Left Aileron
     aileron_right = "Create_SequencedGearshift_7",    -- Sequenced Gearshift -> Right Aileron
     rudder = "right",              -- Sequenced Gearshift -> Rudder (optional)
     -- Throttle control
-    throttle = "Create_RotationSpeedController_0",           -- Rotation Speed Controller for propeller
+    throttle = "Create_RotationSpeedController_1",           -- Rotation Speed Controller for propeller
     -- Display
     display = nil,           -- Display Link or monitor
 }
